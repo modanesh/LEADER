@@ -1,0 +1,12 @@
+*.swp
+*.swo
+*.pyc
+.catkin_tools/
+.idea/
+.rosinstall
+*tmp*
+.DS_Store
+devel/
+build/
+logs/
+cmake-build-debug/
