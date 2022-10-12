@@ -1,0 +1,484 @@
+import os
+import zmq
+import sys
+import time
+import glob
+import rospy
+import torch
+import struct
+import random
+import datetime
+import argparse
+import numpy as np
+import torch.nn as nn
+from torch import optim
+from clear_process import *
+from subprocess import PIPE
+from argparse import Namespace
+from replay import ReplayBuffer
+from itertools import zip_longest
+from timeout import TimeoutMonitor
+from multiprocessing import Process
+from models import AttentionNet, CriticNet
+from summit_simulator import print_flush, SimulatorAccessories
+from crowd_pomdp_planner.srv import ValueService, ValueServiceResponse
+from car_hyp_despot.srv import ImportanceDistService, ImportanceDistServiceResponse
+
+
+def normal_rand_attentions(att_len):
+    weights = np.random.normal(0.5, 0.5, att_len)
+    weights[weights < 0] = 0
+    return weights / sum(weights)
+
+
+def uniform_rand_attentions(att_len):
+    weights = np.random.random(att_len)
+    return weights / sum(weights)
+
+
+def init_case_dirs():
+    global subfolder, result_subfolder
+    subfolder = config.summit_maploc
+    result_subfolder = os.path.join(root_path, 'result', 'joint_pomdp_drive_mode', subfolder)
+    mak_dir(result_subfolder)
+    mak_dir(result_subfolder + '_debug')
+
+
+def mak_dir(path):
+    if sys.version_info[0] > 2:
+        os.makedirs(path, exist_ok=True)
+    else:
+        if not os.path.exists(path):
+            os.makedirs(path)
+
+
+def get_bag_file_name(run):
+    dir = result_subfolder
+    file_name = 'pomdp_search_log-' + str(run) + '_pid-' + str(os.getpid()) + '_r-' + str(config.random_seed)
+    existing_bags = glob.glob(dir + "*.bag")
+    # remove existing bags for the same run
+    for bag_name in existing_bags:
+        if file_name in bag_name:
+            print_flush("[attention_planner_training.py] removing {}".format(bag_name))
+            os.remove(bag_name)
+    existing_active_bags = glob.glob(dir + "*.bag.active")
+    # remove existing bags for the same run
+    for active_bag_name in existing_active_bags:
+        if file_name in active_bag_name:
+            print_flush("[attention_planner_training.py] removing {}".format(active_bag_name))
+            os.remove(active_bag_name)
+    return os.path.join(dir, file_name)
+
+
+def monitor_subprocess(queue):
+    global monitor_worker
+    monitor_worker.feed_queue(queue)
+    # Setting daemon to True will let the main thread exit even though the workers are blocking
+    monitor_worker.daemon = True
+    monitor_worker.start()
+    if config.verbosity > 0:
+        print_flush("[attention_planner_training.py] SubprocessMonitor started")
+
+
+##############################################################################################################
+# Launching env and planner
+##############################################################################################################
+def launch_ros():
+    print_flush("[attention_planner_training.py] Launching ros")
+    sys.stdout.flush()
+    cmd_args = "roscore -p {}".format(config.ros_port)
+    if config.verbosity > 0:
+        print_flush(cmd_args)
+    ros_proc = subprocess.Popen(cmd_args.split(), env=config.ros_env)
+
+    while check_ros(config.ros_master_url, config.verbosity) is False:
+        time.sleep(1)
+
+    if config.verbosity > 0:
+        print_flush("[attention_planner_training.py] roscore started")
+    return ros_proc
+
+
+def launch_summit_simulator(cmd_args):
+    shell_cmd = './CarlaUE4.sh -opengl -carla-rpc-port={} -carla-streaming-port={}'.format(config.port, config.port+1)
+    if config.verbosity > 0:
+        print_flush('')
+        print_flush('[attention_planner_training.py] {}'.format(shell_cmd))
+
+    summit_proc = subprocess.Popen(shell_cmd, cwd=os.path.join(os.path.expanduser("~"), "summit"),
+                                   env=dict(config.ros_env, DISPLAY=''), shell=True, preexec_fn=os.setsid)
+
+    wait_for(config.max_launch_wait, summit_proc, 'summit')
+    global_proc_queue.append((summit_proc, "summit", None))
+    time.sleep(4)
+
+    sim_accesories = SimulatorAccessories(cmd_args, config)
+    sim_accesories.start()
+
+    # ros connector for summit
+    shell_cmd = 'roslaunch summit_connector connector.launch port:=' + \
+                str(config.port) + ' pyro_port:=' + str(config.pyro_port) + \
+                ' map_location:=' + str(config.summit_maploc) + \
+                ' random_seed:=' + str(config.random_seed) + \
+                ' num_car:=' + str(cmd_args.num_car) + \
+                ' num_bike:=' + str(cmd_args.num_bike) + \
+                ' num_ped:=' + str(cmd_args.num_pedestrian)
+    shell_cmd = shell_cmd + ' ego_control_mode:=other ego_speed_mode:=vel'
+    if config.verbosity > 0:
+        print_flush('[attention_planner_training.py] {}'.format(shell_cmd))
+    summit_connector_proc = subprocess.Popen(shell_cmd.split(), env=config.ros_env,
+                                             cwd=os.path.join(ws_root, "src/summit_connector/launch"))
+    wait_for(config.max_launch_wait, summit_connector_proc, '[launch] summit_connector')
+    global_proc_queue.append((summit_connector_proc, "summit_connector_proc", None))
+
+    return sim_accesories
+
+
+def handle_imp_weight(req, socket):
+    belief = req.belief
+    context = req.context
+    # is_weight = [belief[i] + context[i] for i in range(min(len(context), len(belief)))]
+    socket.send_pyobj(("SEEK_ATTENTION".encode('ascii'), belief, context, replay_buffer))
+    is_weight = socket.recv_pyobj()
+    p0_to_be_stored_data = np.array(list(zip_longest(*np.array((belief, context, is_weight), dtype=object), fillvalue=0))).T
+    trajectory_replay_buffer.extend(p0_to_be_stored_data)
+    return ImportanceDistServiceResponse(is_weight)
+
+
+def handle_value(req, socket):
+    value = req.value
+    # trajectory_replay_buffer.extend([np.insert(np.zeros(np.array(trajectory_replay_buffer).shape[1]-1), 0, value)])
+    # MAX_TRAJECTORY_LENGTH * 3 : it is multiplied by 3 because there are 3 features to be added to the replay_buffer,
+    # belief, context, and weights.
+    remaining_trajectory = np.zeros((MAX_TRAJECTORY_LENGTH * 3 - len(trajectory_replay_buffer),
+                                     np.array(trajectory_replay_buffer).shape[1]))
+    full_trajectory = np.vstack([np.array(trajectory_replay_buffer), remaining_trajectory,
+                                 np.insert(np.zeros(np.array(trajectory_replay_buffer).shape[1]-1), 0, value)])
+    replay_buffer.append(np.array(full_trajectory))
+    np.save('./models/replay_buffer.npy', np.array(replay_buffer.buffer))
+    trajectory_replay_buffer.clear()
+    socket.send_pyobj(("UPDATE_MODELS".encode('ascii'), value, replay_buffer))
+    socket.recv_pyobj()
+    return ValueServiceResponse(1)
+
+
+def launch_pomdp_planner(run, socket):
+    rospy.init_node('launch_pomdp_planner')
+    # rospy.spin()
+    pomdp_proc, rviz_out = None, None
+    launch_file = 'planner.launch'
+    if config.debug:
+        launch_file = 'planner_debug.launch'
+
+    shell_cmd = 'roslaunch --wait crowd_pomdp_planner ' + launch_file + ' gpu_id:=' + str(config.gpu_id) + ' mode:=' + \
+                str(config.drive_mode) + ' summit_port:=' + str(config.port) + ' time_scale:=' + \
+                str.format("%.2f" % config.time_scale) + ' map_location:=' + config.summit_maploc
+    pomdp_out = open(get_bag_file_name(run) + '.txt', 'w')
+    print_flush("=> Search log {}".format(pomdp_out.name))
+    if config.verbosity > 0:
+        print_flush('[attention_planner_training.py] {}'.format(shell_cmd))
+    start_t = time.time()
+    try:
+        pomdp_proc = subprocess.Popen(shell_cmd.split(), env=config.ros_env, stdout=pomdp_out, stderr=pomdp_out)
+        print_flush('[attention_planner_training.py] POMDP planning...')
+        monitor_subprocess(global_proc_queue)
+        s = rospy.Service('importance_weight_calculation', ImportanceDistService, lambda msg: handle_imp_weight(msg, socket))
+        s = rospy.Service('adding_value', ValueService, lambda msg: handle_value(msg, socket))
+
+        pomdp_proc.wait(timeout=int(config.eps_length / config.time_scale))
+
+        print_flush("[attention_planner_training.py] episode successfully ended")
+    except subprocess.TimeoutExpired:
+        print_flush("[attention_planner_training.py] episode reaches full length {} s".format(config.eps_length / config.time_scale))
+    finally:
+        elapsed_time = time.time() - start_t
+        print_flush('[attention_planner_training.py] POMDP planner exited in {} s'.format(elapsed_time))
+    return pomdp_proc
+
+
+
+##############################################################################################################
+# Process and ZMQ messaging between planner and learner
+##############################################################################################################
+def zmqserver_learning(zmq_port):
+    # MAX_TRAJECTORY_LENGTH * 2 : because only 2 features out of 3 are fed into the attention generator, thus
+    # the MAX_TRAJECTORY_LENGTH should be multiplied by 2
+    attention_model = AttentionNet(2 * MAX_FEATURE_LEN).float().to(DEVICE)
+    # MAX_TRAJECTORY_LENGTH * 3 : because all 3 features out of 3 are fed into the critic, thus
+    # the MAX_TRAJECTORY_LENGTH should be multiplied by 3
+    critic_model = CriticNet(int(MAX_TRAJECTORY_LENGTH * 3) * MAX_FEATURE_LEN).float().to(DEVICE)
+    attention_model_optimizer = optim.Adam(attention_model.parameters(), lr=LR)
+    critic_model_optimizer = optim.Adam(critic_model.parameters(), lr=LR)
+
+    old_attention_loss, old_critic_loss = None, None
+    attention_loss, critic_loss = None, None
+
+    for file_path in os.listdir("./models"):
+        if file_path.__contains__("crit"):
+            critic_model.load_state_dict(torch.load(os.path.join("./models", file_path), map_location=DEVICE))
+            print_flush("CRITIC MODEL LOADED SUCCESSFULLY")
+            old_critic_loss = file_path.split("_l")[1][:-3]
+            if old_critic_loss == "None":
+                old_critic_loss = None
+            else:
+                old_critic_loss = float(old_critic_loss)
+        elif file_path.__contains__("gen"):
+            attention_model.load_state_dict(torch.load(os.path.join("./models", file_path), map_location=DEVICE))
+            print_flush("ATTENTION MODEL LOADED SUCCESSFULLY")
+            old_attention_loss = file_path.split("_l")[1][:-3]
+            if old_attention_loss == "None":
+                old_attention_loss = None
+            else:
+                old_attention_loss = float(old_attention_loss)
+        elif file_path.__contains__("replay"):
+            replay_buffer_path = os.path.join("./models", file_path)
+
+    if DEVICE is not 'cpu':
+        attention_memory = torch.Tensor(np.random.random((1, MEMORY_SIZE))).cuda()
+        critic_memory = torch.Tensor(np.random.random((BATCH_SIZE, MEMORY_SIZE))).cuda()
+    else:
+        attention_memory = torch.Tensor(np.random.random((1, MEMORY_SIZE)))
+        critic_memory = torch.Tensor(np.random.random((BATCH_SIZE, MEMORY_SIZE)))
+    training_counter = 0
+    context = zmq.Context()
+    socket = context.socket(zmq.REP)
+    socket.bind("tcp://*:%s" % zmq_port)
+    print_flush("Running server on port: {}".format(zmq_port))
+    while True:
+        message = socket.recv_pyobj()
+        instruction = message[0].decode("utf-8")
+        instruction_data = message[1:]
+
+        if instruction == "Terminate":
+            socket.send_pyobj(0)
+            socket.close()
+            print_flush("SERVER PROCESS TERMINATED!")
+            break
+        elif instruction == "SEEK_ATTENTION":
+            updated_rep_buf = instruction_data[2]
+            if len(updated_rep_buf) < REPLAY_MIN or HANDCRAFTED_ATT or training_counter < 1000:
+                is_weights = uniform_rand_attentions(ATTENTION_SIZE)
+            else:
+                with torch.no_grad():
+                    is_weights, attention_memory = attention_model(torch.tensor(np.array(list(
+                        zip_longest(*np.array((instruction_data[0], instruction_data[1]), dtype=object),
+                                    fillvalue=0))).reshape(1, -1), device=DEVICE).float(), attention_memory)
+                    is_weights = is_weights.squeeze(0).cpu().numpy()
+            socket.send_pyobj(is_weights)
+        elif instruction == "UPDATE_MODELS" and not HANDCRAFTED_ATT:
+            socket.send_pyobj(0)
+            updated_rep_buf = instruction_data[1]
+            if len(updated_rep_buf) < REPLAY_MIN:
+                print_flush('Waiting for minimum buffer size ... {}/{}'.format(len(updated_rep_buf), REPLAY_MIN))
+                continue
+
+            training_counter += 1
+            # data_point = (b_1, c_1, w_1, b_2, c_2, w_2, ..., b_n, c_n, w_n, v_hat)
+            sampled_data = np.array(updated_rep_buf.sample(BATCH_SIZE))
+            true_values = sampled_data[:, -1, 0]
+
+            # update critic
+            # v = Critic(b_1, c_1, w_1, b_2, c_2, w_2, ..., b_n, c_n, w_n)
+            # critic_loss = ||v-v_hat||
+            mse_loss = nn.MSELoss()
+            critic_input = torch.Tensor(np.array(sampled_data)[:, :-1], device=DEVICE).reshape(BATCH_SIZE, -1)
+            estimated_values, critic_memory = critic_model(critic_input, critic_memory.detach())
+            critic_loss = mse_loss(estimated_values, torch.Tensor(true_values).reshape([-1,1]))
+            print_flush("-------> Critic loss: {}".format(critic_loss))
+            critic_model_optimizer.zero_grad()
+            critic_loss.backward()
+            critic_model_optimizer.step()
+            if type(old_critic_loss) == float:
+                if critic_loss.item() <= old_critic_loss:
+                    for f_name in os.listdir("./models"):
+                        if f_name.__contains__("attention_crit_l"):
+                            os.remove(os.path.join("./models", f_name))
+                    torch.save(critic_model.state_dict(), os.path.join("./models", "attention_crit_l{:0.3e}".format(critic_loss.item()) + ".pt"))
+                    old_critic_loss = critic_loss.item()
+                    print_flush("NEW CRITIC MODEL SAVED")
+            elif old_critic_loss is None:
+                torch.save(critic_model.state_dict(), os.path.join("./models", "attention_crit_l{:0.3e}".format(critic_loss.item()) + ".pt"))
+                old_critic_loss = critic_loss.item()
+                print_flush("NEW CRITIC MODEL SAVED")
+
+            # A trick to train the critic first (for 1000 times) w/ uniform attention, and once the
+            # critic is "reasonably" learned, start training the attention generator
+            if training_counter >= 1000:
+                # update attention generator
+                # w_i = Generator(b_i, c_i)
+                # generator_loss = min(v)
+                l1_loss = nn.L1Loss()
+                attention_loss = l1_loss(estimated_values.requires_grad_(), torch.zeros(estimated_values.shape))
+                # since the estimated_values are mostly negative, then it should be multiplied by -1 to make l1 loss
+                # negative thus the minimization works fine
+                attention_model_optimizer.zero_grad()
+                (-attention_loss).backward()
+                torch.nn.utils.clip_grad_norm_(attention_model.parameters(), 1.0)
+                attention_model_optimizer.step()
+
+                if type(old_attention_loss) == float:
+                    if attention_loss.item() <= old_attention_loss:
+                        for f_name in os.listdir("./models"):
+                            if f_name.__contains__("attention_crit_l"):
+                                os.remove(os.path.join("./models", f_name))
+                        torch.save(attention_model.state_dict(), os.path.join("./models", "attention_gen_l{:0.3e}".format(attention_loss.item()) + ".pt"))
+                        old_attention_loss = attention_loss.item()
+                        print_flush("NEW ATTENTION MODEL SAVED")
+                elif old_attention_loss is None:
+                    torch.save(attention_model.state_dict(), os.path.join("./models", "attention_gen_l{:0.3e}".format(attention_loss.item()) + ".pt"))
+                    old_attention_loss = attention_loss.item()
+                    print_flush("NEW ATTENTION MODEL SAVED")
+
+
+def zmqclient_process_env(zmq_port, run):
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.connect("tcp://localhost:%s" % zmq_port)
+    pid = os.getpid()
+    print_flush("---------> ITERATION: {}".format(run))
+    update_global_config(cmd_args)
+    global monitor_worker
+    monitor_worker = SubprocessMonitor(config.ros_port, config.verbosity)
+    outter_timer = TimeoutMonitor(pid, int(config.timeout / config.time_scale), "ego_script_timer", config.verbosity)
+    outter_timer.start()
+    # ros_proc = launch_ros()
+    global_proc_queue.clear()
+    init_case_dirs()
+    sim_accesories = launch_summit_simulator(cmd_args)
+    pomdp_proc = launch_pomdp_planner(run, socket)
+
+    # terminating everything:
+    print_flush('[run_data_collection.py] is ending! Clearing ros nodes...')
+    kill_ros_nodes(config.ros_pref)
+    print_flush('[run_data_collection.py] is ending! Clearing Processes...')
+    try:
+        monitor_worker.terminate()
+    except Exception as e:
+        print_flush(e)
+    try:
+        sim_accesories.terminate()
+    except Exception as e:
+        print_flush(e)
+    print_flush('[run_data_collection.py] is ending! Clearing timer...')
+    try:
+        outter_timer.terminate()
+    except Exception as e:
+        print_flush(e)
+    print_flush('[run_data_collection.py] is ending! Clearing subprocesses...')
+    clear_queue(global_proc_queue)
+    print_flush('exit [run_data_collection.py]')
+
+    socket.send_pyobj(("Terminate".encode('ascii'), 0))
+    socket.recv_pyobj()
+
+
+##############################################################################################################
+# Configuration
+##############################################################################################################
+def update_global_config(cmd_args):
+    # Update the global configurations according to command line
+    print_flush("Parsing config")
+    config.verbosity = cmd_args.verb
+    config.gpu_id = cmd_args.gpu_id
+    config.port = cmd_args.port
+    # config.ros_port = config.port + 111
+    config.ros_port = config.port + 9311
+    config.pyro_port = config.port + 6100
+    config.ros_master_url = "http://localhost:{}".format(config.ros_port)
+    config.ros_pref = "ROS_MASTER_URI=http://localhost:{} ".format(config.ros_port)
+    config.ros_env = os.environ.copy()
+    config.ros_env['ROS_MASTER_URI'] = 'http://localhost:{}'.format(config.ros_port)
+
+    config.summit_maploc = random.choice(['meskel_square', 'magic', 'highway'])
+    config.random_seed = cmd_args.rands
+    config.eps_length = cmd_args.eps_len
+    config.time_scale = cmd_args.t_scale
+    config.timeout = 11 * 120 * 4
+    config.max_launch_wait = 10
+    config.make = bool(cmd_args.make)
+    config.debug = bool(cmd_args.debug)
+    compile_mode = 'Release'
+    if config.debug:
+        compile_mode = 'Debug'
+    if config.make:
+        try:
+            shell_cmds = ["catkin config --merge-devel", "catkin build --cmake-args -DCMAKE_BUILD_TYPE=" + compile_mode]
+            for shell_cmd in shell_cmds:
+                print_flush('[attention_planner_training.py] {}'.format(shell_cmd))
+                make_proc = subprocess.call(shell_cmd, cwd=ws_root, shell=True)
+        except Exception as e:
+            print_flush(e)
+            exit(12)
+        print_flush("[attention_planner_training.py] make done")
+
+    # drive mode: joint-pomdp
+    config.drive_mode = 1
+
+
+def parse_cmd_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--verb', type=int, default=1,
+                        help='Verbosity')
+    parser.add_argument('--gpu_id', type=int, default=0,
+                        help='GPU ID for hyp-despot')
+    parser.add_argument('--t_scale', type=float, default=1.0,
+                        help='Factor for scaling down the time in simulation (to search for longer time)')
+    parser.add_argument('--make', type=int, default=1,
+                        help='Make the simulator package')
+    parser.add_argument('--port', type=int, default=2000,
+                        help='Summit port')
+    parser.add_argument('--rands', type=int, default=0,
+                        help='Random seed in summit simulator')
+    parser.add_argument('--eps_len', type=float, default=120.0,
+                        help='Length of episodes in terms of seconds')
+    parser.add_argument('--device', type=str, default="cpu",
+                        help='Whether to use GPU or CPU')
+    parser.add_argument('--debug', type=int, default=0,
+                        help='Debug mode')
+    parser.add_argument('--num_car', default='75', type=int,
+                        help='Number of cars to spawn')
+    parser.add_argument('--num_bike', default='25', type=int,
+                        help='Number of bikes to spawn')
+    parser.add_argument('--num_pedestrian', default='10', type=int,
+                        help='Number of pedestrians to spawn')
+    parser.add_argument('--handcraft_attention', action='store_true', default=False,
+                        help='Use hand-crafted attention (uniform dist) or not')
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    REPLAY_MIN = 5
+    REPLAY_MAX = 100000
+    BATCH_SIZE = 2
+    MEMORY_SIZE = 1024
+    MAX_TRAJECTORY_LENGTH = 1200
+    MAX_FEATURE_LEN = 14
+    LR = 1e-4
+    trajectory_replay_buffer = []
+    replay_buffer = ReplayBuffer(REPLAY_MAX)
+    for file_path in os.listdir("./models"):
+        if file_path == "replay_buffer.npy":
+            replay_buffer.buffer = list(np.load(os.path.join("./models", file_path)))
+            print_flush("REPLAY BUFFER LOADED SUCCESSFULLY: {}".format(len(replay_buffer.buffer)))
+    ws_root = os.getcwd()
+    ws_root = os.path.dirname(ws_root)
+    ws_root = os.path.dirname(ws_root)
+    print_flush("workspace root: {}".format(ws_root))
+
+    ATTENTION_SIZE = 10
+    config = Namespace()
+    cmd_args = parse_cmd_args()
+    DEVICE = cmd_args.device
+    HANDCRAFTED_ATT = cmd_args.handcraft_attention
+    global_proc_queue = []
+    # update_global_config(cmd_args)
+    root_path = os.path.join(os.path.expanduser("~"), 'driving_data')
+
+    run_number = 0
+    env_p = Process(target=zmqclient_process_env, args=(5550, run_number))
+    env_p.start()
+    learn_p = Process(target=zmqserver_learning, args=(5550,))
+    learn_p.start()
+
+
+

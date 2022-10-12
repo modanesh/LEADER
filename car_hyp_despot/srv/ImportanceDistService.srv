@@ -1,0 +1,4 @@
+float64[] belief
+float64[] context
+---
+float64[] weights
