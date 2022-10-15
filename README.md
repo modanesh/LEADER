@@ -1,7 +1,7 @@
 #
 # LEADER
 
-This is the implementation of the LEADER introduced in this paper [LEADER: Learning Attention over Driving Behaviors for Planning under Uncertainty](https://arxiv.org/abs/2209.11422).
+This is the implementation of the LEADER introduced in this paper [LEADER: Learning Attention over Driving Behaviors for Planning under Uncertainty](https://arxiv.org/abs/2209.11422). Please take a look at more driving videos here: https://sites.google.com/view/leader-paper/home
 
 If you find it useful in your research, please cite it using :
 
