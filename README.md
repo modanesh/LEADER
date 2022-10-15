@@ -102,3 +102,6 @@ Once the training is done, it will save models in the `~/catkin_ws/src/py_script
 cd ~/catkin_ws/src/py_scripts
 python statistics.py --folder /path/to/driving_data/joint_pomdp_baseline/ 
 ```
+
+## Acknowledgement
+This code base is inspired by the Context-POMDP implemenetation, accessible here: https://github.com/AdaCompNUS/context-pomdp
