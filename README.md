@@ -47,8 +47,8 @@ The repository structure has the following conceptual architecture:
 * Ubuntu 18.04
 * CUDA 10.0
 * Python 3.6
-* Install ROS-Melodic
-* Install catkin_tools: catkin_tools is used for code building in this package instead of the default catkin_make that comes with ROS.
+* ROS-Melodic
+* catkin_tools: catkin_tools is used for code building in this package instead of the default catkin_make that comes with ROS.
 
 ### Setup planner
 #### Prepare catkin workspace
